@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly COMPLETE_MARKER="/var/lib/entropy39-node/setup-complete"
+
+service_result="${1:-unknown}"
+
+if [[ "${service_result}" == "success" && -f "${COMPLETE_MARKER}" ]]; then
+    # Enable the normal login first so an interruption cannot leave tty1 with
+    # neither service enabled. The marker-gated restore unit starts it only
+    # after the conflicting first-boot unit has fully stopped.
+    systemctl enable getty@tty1.service
+    systemctl disable firstboot.service
+fi

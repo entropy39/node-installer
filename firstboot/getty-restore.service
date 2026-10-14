@@ -1,0 +1,8 @@
+[Unit]
+Description=Restore the normal tty1 login after Entropy39 setup
+ConditionPathExists=/var/lib/entropy39-node/setup-complete
+After=firstboot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --no-block start getty@tty1.service

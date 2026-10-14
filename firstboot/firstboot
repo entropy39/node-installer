@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+readonly REPOSITORY_URL="https://github.com/entropy39/node-installer.git"
+readonly REPOSITORY_BRANCH="main"
+readonly INSTALL_DIR="/usr/local/lib/node-installer"
+readonly STAGING_DIR="/usr/local/lib/node-installer.staging"
+readonly STATE_DIR="/var/lib/entropy39-node"
+readonly LOG_DIR="/var/log/entropy39-node"
+readonly COMMIT_RECORD="${STATE_DIR}/installer-commit"
+readonly COMPLETE_MARKER="${STATE_DIR}/setup-complete"
+readonly BOOTSTRAP_MARKER_NAME=".entropy39-bootstrap-staging"
+readonly STAGING_MARKER="${STAGING_DIR}/${BOOTSTRAP_MARKER_NAME}"
+readonly INSTALLED_BOOTSTRAP_MARKER="${INSTALL_DIR}/${BOOTSTRAP_MARKER_NAME}"
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+
+prepare_logging() {
+    install -d -o root -g root -m 0755 "${STATE_DIR}"
+    install -d -o root -g adm -m 0750 "${LOG_DIR}"
+    touch "${LOG_DIR}/setup.log"
+    chown root:adm "${LOG_DIR}/setup.log"
+    chmod 0640 "${LOG_DIR}/setup.log"
+    exec > >(tee -a "${LOG_DIR}/setup.log") 2>&1
+    printf '\n===== Entropy39 first-boot setup: %s =====\n' "$(date --iso-8601=seconds)"
+}
+
+check_environment() {
+    [[ "${EUID}" -eq 0 ]] || die "First-boot setup must run as root."
+    [[ -t 0 && -t 1 ]] || die "First-boot setup requires an interactive console."
+    [[ "$(tty)" == "/dev/tty1" ]] || die "First-boot setup may run only on the local tty1 console."
+    for command_name in curl git install systemctl tee; do
+        command -v "${command_name}" >/dev/null 2>&1 || die "Required command not found: ${command_name}"
+    done
+}
+
+verify_installer_checkout() {
+    local recorded_commit actual_commit origin_url
+
+    [[ -d "${INSTALL_DIR}/.git" && -f "${COMMIT_RECORD}" ]] || return 1
+    read -r recorded_commit <"${COMMIT_RECORD}" || return 1
+    [[ "${recorded_commit}" =~ ^[0-9a-f]{40}$ ]] || return 1
+    actual_commit="$(git -C "${INSTALL_DIR}" rev-parse HEAD 2>/dev/null)" || return 1
+    [[ "${actual_commit}" == "${recorded_commit}" ]] || return 1
+    origin_url="$(git -C "${INSTALL_DIR}" remote get-url origin 2>/dev/null)" || return 1
+    [[ "${origin_url}" == "${REPOSITORY_URL}" ]] || return 1
+    git -C "${INSTALL_DIR}" fsck --full --no-dangling >/dev/null || return 1
+    git -C "${INSTALL_DIR}" diff --quiet "${recorded_commit}" -- . || return 1
+    [[ -z "$(git -C "${INSTALL_DIR}" ls-files --others --exclude-standard)" ]] || return 1
+    [[ -x "${INSTALL_DIR}/firstboot/setup" ]] || return 1
+}
+
+remove_interrupted_staging() {
+    [[ -e "${STAGING_DIR}" ]] || return 0
+    [[ -f "${STAGING_MARKER}" ]] || {
+        die "Refusing to remove unexpected path ${STAGING_DIR}; resolve it from the maintenance shell."
+        return 1
+    }
+    log "Removing an interrupted installer download"
+    rm -rf -- "${STAGING_DIR}"
+}
+
+recover_interrupted_checkout() {
+    local commit origin_url untracked temporary_record
+
+    [[ -f "${INSTALLED_BOOTSTRAP_MARKER}" && -d "${INSTALL_DIR}/.git" ]] || return 1
+    origin_url="$(git -C "${INSTALL_DIR}" remote get-url origin 2>/dev/null)" || return 1
+    [[ "${origin_url}" == "${REPOSITORY_URL}" ]] || return 1
+    commit="$(git -C "${INSTALL_DIR}" rev-parse HEAD 2>/dev/null)" || return 1
+    [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || return 1
+    git -C "${INSTALL_DIR}" fsck --full --no-dangling >/dev/null || return 1
+    git -C "${INSTALL_DIR}" diff --quiet "${commit}" -- . || return 1
+    untracked="$(git -C "${INSTALL_DIR}" ls-files --others --exclude-standard)"
+    [[ "${untracked}" == "${BOOTSTRAP_MARKER_NAME}" ]] || return 1
+
+    temporary_record="${COMMIT_RECORD}.new"
+    printf '%s\n' "${commit}" >"${temporary_record}"
+    chown root:root "${temporary_record}"
+    chmod 0644 "${temporary_record}"
+    mv "${temporary_record}" "${COMMIT_RECORD}"
+    rm -f -- "${INSTALLED_BOOTSTRAP_MARKER}"
+    log "Recovered installer checkout at commit ${commit}"
+}
+
+retrieve_installer() {
+    local commit temporary_record
+
+    if [[ -e "${INSTALL_DIR}" ]]; then
+        if [[ -f "${INSTALLED_BOOTSTRAP_MARKER}" ]]; then
+            recover_interrupted_checkout || {
+                die "The interrupted installer checkout could not be verified and was left untouched."
+                return 1
+            }
+        fi
+        verify_installer_checkout || {
+            die "The existing installer checkout failed integrity verification and was left untouched."
+            return 1
+        }
+        log "Using Entropy39 installer commit $(<"${COMMIT_RECORD}")"
+        return 0
+    fi
+
+    log "Retrieving the current Entropy39 installer as one Git commit"
+    remove_interrupted_staging || return 1
+    install -d -o root -g root -m 0700 "${STAGING_DIR}"
+    touch "${STAGING_MARKER}"
+    git -C "${STAGING_DIR}" init --quiet
+    git -C "${STAGING_DIR}" remote add origin "${REPOSITORY_URL}"
+    git -C "${STAGING_DIR}" fetch --quiet --depth 1 origin "refs/heads/${REPOSITORY_BRANCH}" || {
+        die "Could not retrieve the Entropy39 installer from GitHub."
+        return 1
+    }
+    commit="$(git -C "${STAGING_DIR}" rev-parse FETCH_HEAD^{commit})"
+    [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || {
+        die "Git returned an invalid installer commit ID."
+        return 1
+    }
+    git -C "${STAGING_DIR}" checkout --quiet --detach "${commit}" || return 1
+    git -C "${STAGING_DIR}" fsck --full --no-dangling >/dev/null || {
+        die "The downloaded installer Git object database failed its integrity check."
+        return 1
+    }
+    git -C "${STAGING_DIR}" diff --quiet "${commit}" -- . || {
+        die "The downloaded installer files do not match commit ${commit}."
+        return 1
+    }
+    chown -R root:root "${STAGING_DIR}"
+    chmod -R go-w "${STAGING_DIR}"
+    mv "${STAGING_DIR}" "${INSTALL_DIR}"
+
+    temporary_record="${COMMIT_RECORD}.new"
+    printf '%s\n' "${commit}" >"${temporary_record}"
+    chown root:root "${temporary_record}"
+    chmod 0644 "${temporary_record}"
+    mv "${temporary_record}" "${COMMIT_RECORD}"
+    rm -f -- "${INSTALLED_BOOTSTRAP_MARKER}"
+    log "Recorded Entropy39 installer commit ${commit}"
+}
+
+failure_menu() {
+    local choice
+
+    while true; do
+        printf '\nEntropy39 setup did not complete. Choose an action:\n'
+        printf '  1) Retry setup\n'
+        printf '  2) Root maintenance shell\n'
+        printf '  3) Reboot\n'
+        printf '  4) Shut down\n'
+        read -r -p 'Selection [1]: ' choice
+        case "${choice:-1}" in
+            1) return 0 ;;
+            2)
+                printf 'Type exit to return to the Entropy39 recovery menu.\n'
+                /bin/bash -l
+                ;;
+            3) systemctl reboot; exit 0 ;;
+            4) systemctl poweroff; exit 0 ;;
+            *) printf 'Please choose 1, 2, 3 or 4.\n' ;;
+        esac
+    done
+}
+
+main() {
+    prepare_logging
+    check_environment
+
+    if [[ -f "${COMPLETE_MARKER}" ]]; then
+        log "Entropy39 setup is already complete."
+        return 0
+    fi
+
+    while true; do
+        if retrieve_installer && "${INSTALL_DIR}/firstboot/setup"; then
+            return 0
+        fi
+        failure_menu
+    done
+}
+
+main "$@"

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+readonly SOURCE_DIR="/usr/local/lib/node-installer"
+readonly STATE_DIR="/var/lib/entropy39-node"
+readonly COMPLETE_MARKER="${STATE_DIR}/setup-complete"
+readonly INSTALLER_COMMIT_RECORD="${STATE_DIR}/installer-commit"
+readonly DASHBOARD_INSTALLER="${SOURCE_DIR}/installers/install-dashboard.sh"
+readonly BITCOIN_INSTALLER="${SOURCE_DIR}/installers/install-bitcoin-core.sh"
+readonly DASHBOARD_DIR="/srv/www/dashboard"
+readonly DASHBOARD_COMMIT_RECORD="${STATE_DIR}/dashboard-installed-commit"
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+
+dashboard_is_verified() {
+    local actual_commit recorded_commit
+
+    [[ -d "${DASHBOARD_DIR}/.git" && -f "${DASHBOARD_COMMIT_RECORD}" ]] || return 1
+    read -r recorded_commit <"${DASHBOARD_COMMIT_RECORD}" || return 1
+    [[ "${recorded_commit}" =~ ^[0-9a-f]{40}$ ]] || return 1
+    actual_commit="$(git -C "${DASHBOARD_DIR}" rev-parse HEAD 2>/dev/null)" || return 1
+    [[ "${actual_commit}" == "${recorded_commit}" ]] || return 1
+    [[ -f "${DASHBOARD_DIR}/config/bitcoin-rpc.php" ]] || return 1
+    systemctl is-active --quiet apache2.service || return 1
+    systemctl is-active --quiet shutdownd.service || return 1
+    curl --fail --silent --show-error http://127.0.0.1/ >/dev/null || return 1
+}
+
+verify_dashboard() {
+    local actual_commit recorded_commit
+
+    [[ -d "${DASHBOARD_DIR}/.git" ]] || die "Dashboard Git metadata is missing."
+    [[ -f "${DASHBOARD_COMMIT_RECORD}" ]] || die "The Dashboard commit record is missing."
+    read -r recorded_commit <"${DASHBOARD_COMMIT_RECORD}" || die "Cannot read the Dashboard commit record."
+    actual_commit="$(git -C "${DASHBOARD_DIR}" rev-parse HEAD 2>/dev/null)" || \
+        die "Cannot determine the installed Dashboard commit."
+    [[ "${actual_commit}" == "${recorded_commit}" ]] || \
+        die "The installed Dashboard does not match its recorded commit."
+    [[ -f "${DASHBOARD_DIR}/config/bitcoin-rpc.php" ]] || die "Dashboard RPC configuration is missing."
+    systemctl is-active --quiet apache2.service || die "Apache2 is not active."
+    systemctl is-active --quiet shutdownd.service || die "The Dashboard shutdown service is not active."
+    curl --fail --silent --show-error http://127.0.0.1/ >/dev/null || \
+        die "The Dashboard did not return a successful local HTTP response."
+}
+
+bitcoin_is_complete() {
+    [[ ! -e "${STATE_DIR}/bitcoin-core-install-incomplete" ]] || return 1
+    [[ -f /etc/bitcoin.conf && -f /etc/systemd/system/bitcoind.service ]] || return 1
+    [[ -x /usr/local/bin/bitcoind && -x /usr/local/bin/bitcoin-cli ]] || return 1
+    [[ -L /usr/local/bin/bitcoind && -L /usr/local/bin/bitcoin-cli ]] || return 1
+    [[ -d /var/lib/bitcoin ]] || return 1
+    systemctl is-enabled --quiet bitcoind.service || return 1
+    ! grep -Fq 'RPC-PASSWORD-HERE' "${DASHBOARD_DIR}/config/bitcoin-rpc.php"
+}
+
+verify_bitcoin() {
+    local attempt conf_mode conf_owner home_owner started_for_verification=no
+
+    bitcoin_is_complete || die "Bitcoin Core installation verification failed."
+    conf_mode="$(stat -c '%a' /etc/bitcoin.conf)"
+    conf_owner="$(stat -c '%U:%G' /etc/bitcoin.conf)"
+    home_owner="$(stat -c '%U:%G' /var/lib/bitcoin)"
+    [[ "${conf_mode}" == "640" && "${conf_owner}" == "root:bitcoin" ]] || \
+        die "Unexpected /etc/bitcoin.conf permissions or ownership."
+    [[ "${home_owner}" == "bitcoin:bitcoin" ]] || die "Unexpected /var/lib/bitcoin ownership."
+    grep -Eq '^rpcauth=dashboard:' /etc/bitcoin.conf || die "Dashboard rpcauth is missing from bitcoin.conf."
+    if ! systemctl is-active --quiet bitcoind.service; then
+        log "Starting Bitcoin Core to verify the installation"
+        systemctl start bitcoind.service || {
+            systemctl status bitcoind.service --no-pager >&2 || true
+            die "Bitcoin Core failed to start."
+        }
+        started_for_verification=yes
+    fi
+
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        if systemctl is-active --quiet bitcoind.service && \
+            ! systemctl is-failed --quiet bitcoind.service; then
+            sleep 0.5
+            continue
+        fi
+        systemctl status bitcoind.service --no-pager >&2 || true
+        die "Bitcoin Core did not remain active during startup verification."
+    done
+
+    if [[ "${started_for_verification}" == "yes" ]]; then
+        log "Bitcoin Core startup verified; restoring the requested stopped state"
+        systemctl stop bitcoind.service || die "Bitcoin Core started successfully but could not be stopped after verification."
+        systemctl is-active --quiet bitcoind.service && \
+            die "Bitcoin Core remained active after the verification stop."
+    fi
+}
+
+mark_complete() {
+    local installer_commit dashboard_commit bitcoin_version temporary_marker
+
+    installer_commit="$(<"${INSTALLER_COMMIT_RECORD}")"
+    dashboard_commit="$(<"${DASHBOARD_COMMIT_RECORD}")"
+    bitcoin_version="$(/usr/local/bin/bitcoind --version | awk 'NR == 1 { print $4; exit }')"
+    temporary_marker="${COMPLETE_MARKER}.new"
+    {
+        printf 'completed=%s\n' "$(date --iso-8601=seconds)"
+        printf 'installer_commit=%s\n' "${installer_commit}"
+        printf 'dashboard_commit=%s\n' "${dashboard_commit}"
+        printf 'bitcoin_core_version=%s\n' "${bitcoin_version}"
+    } >"${temporary_marker}"
+    chown root:root "${temporary_marker}"
+    chmod 0644 "${temporary_marker}"
+    mv "${temporary_marker}" "${COMPLETE_MARKER}"
+}
+
+main() {
+    [[ "${EUID}" -eq 0 ]] || die "Entropy39 setup must run as root."
+    [[ -t 0 && -t 1 ]] || die "Entropy39 setup requires an interactive terminal."
+    [[ -x "${DASHBOARD_INSTALLER}" && -x "${BITCOIN_INSTALLER}" ]] || \
+        die "One or more component installers are missing or not executable."
+
+    exec 9>/run/lock/entropy39-setup.lock
+    flock -n 9 || die "Another Entropy39 setup process is already running."
+
+    if dashboard_is_verified; then
+        log "Existing Dashboard installation verified; installation is not being repeated"
+    else
+        log "Installing the Entropy39 Dashboard"
+        "${DASHBOARD_INSTALLER}"
+    fi
+    verify_dashboard
+    log "Dashboard installation verified"
+
+    if bitcoin_is_complete; then
+        log "A complete Bitcoin Core installation is already present; verifying it"
+    else
+        log "Starting the interactive Bitcoin Core installer"
+        "${BITCOIN_INSTALLER}"
+    fi
+    verify_bitcoin
+    log "Bitcoin Core installation verified"
+
+    mark_complete
+    log "Entropy39 Node installation is complete. Normal tty1 login will be restored."
+}
+
+main "$@"
