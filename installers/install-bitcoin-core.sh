@@ -192,7 +192,8 @@ detect_existing_installation() {
 fetch_stable_versions() {
     curl --fail --silent --show-error --location "$RELEASES_URL" |
         grep -Eo 'Bitcoin Core [0-9]+\.[0-9]+(\.[0-9]+)?' |
-        awk '{print $3}' | awk '!seen[$0]++'
+        awk '{print $3}' |
+        awk -F. '!seen[$1]++'
 }
 
 release_is_official() {
@@ -207,21 +208,21 @@ release_is_official() {
 choose_version() {
     local versions=() answer index
     mapfile -t versions < <(fetch_stable_versions)
-    ((${#versions[@]} >= 3)) || die "Could not discover the latest three stable Bitcoin Core releases"
-    versions=("${versions[@]:0:3}")
+    ((${#versions[@]} >= 5)) || die "Could not discover the latest stable Bitcoin Core release from five release series"
+    versions=("${versions[@]:0:5}")
 
     if [[ -z $VERSION ]]; then
         if [[ $UNATTENDED == yes ]]; then
             VERSION=${versions[0]}
         else
-            say "Stable Bitcoin Core releases:"
-            for index in 0 1 2; do printf '  %d) %s%s\n' "$((index + 1))" "${versions[$index]}" "$([[ $index -eq 0 ]] && printf ' (default)')"; done
-            say "  4) Enter another stable version"
+            say "Latest stable Bitcoin Core release from each recent release series:"
+            for index in 0 1 2 3 4; do printf '  %d) %s%s\n' "$((index + 1))" "${versions[$index]}" "$([[ $index -eq 0 ]] && printf ' (default)')"; done
+            say "  6) Enter another stable version"
             read -r -p "Select a version [1]: " answer
             answer=${answer:-1}
             case $answer in
-                1|2|3) VERSION=${versions[$((answer - 1))]} ;;
-                4) read -r -p "Stable Bitcoin Core version: " VERSION ;;
+                1|2|3|4|5) VERSION=${versions[$((answer - 1))]} ;;
+                6) read -r -p "Stable Bitcoin Core version: " VERSION ;;
                 *) die "Invalid version selection" ;;
             esac
         fi
@@ -368,10 +369,17 @@ download_and_verify() {
     local base status_file fpr imported primary valid_count=0 signing_fpr signing_keyid accepted
     local signature_expiry now
     base=$DOWNLOAD_ROOT/bitcoin-core-$VERSION
+    say "Downloading Bitcoin Core release metadata..."
     curl --fail --silent --show-error --location "$base/SHA256SUMS" -o "$WORK_DIR/SHA256SUMS"
     curl --fail --silent --show-error --location "$base/SHA256SUMS.asc" -o "$WORK_DIR/SHA256SUMS.asc"
     grep -Eq "^[0-9a-fA-F]{64}  $ARCHIVE$" "$WORK_DIR/SHA256SUMS" || die "No $BTC_ARCH binary is published for Bitcoin Core $VERSION"
-    curl --fail --silent --show-error --location "$base/$ARCHIVE" -o "$WORK_DIR/$ARCHIVE"
+    say "Downloading Bitcoin Core archive..."
+    if [[ $UNATTENDED == yes ]]; then
+        curl --fail --silent --show-error --location "$base/$ARCHIVE" -o "$WORK_DIR/$ARCHIVE"
+    else
+        curl --fail --show-error --location --progress-bar "$base/$ARCHIVE" -o "$WORK_DIR/$ARCHIVE"
+    fi
+    say "Retrieving Bitcoin Core release signer data..."
     git clone --quiet --depth 1 "$GUIX_SIGS_URL" "$WORK_DIR/guix.sigs"
 
     export GNUPGHOME=$WORK_DIR/gnupg
@@ -391,6 +399,7 @@ download_and_verify() {
     done
 
     status_file=$WORK_DIR/gpg-status
+    say "Verifying Bitcoin Core release signatures..."
     gpg --batch --status-fd 1 --verify "$WORK_DIR/SHA256SUMS.asc" "$WORK_DIR/SHA256SUMS" >"$status_file" 2>"$WORK_DIR/gpg-errors" || true
     now=$(date +%s)
     for fpr in "${TRUSTED_FINGERPRINTS[@]}"; do
@@ -412,8 +421,10 @@ download_and_verify() {
     done
     ((valid_count >= 3)) || die "Only $valid_count trusted distinct signatures validated; at least 3 are required"
 
+    say "Verifying Bitcoin Core archive checksum..."
     (cd "$WORK_DIR" && sha256sum --ignore-missing --check SHA256SUMS | grep -Fx "$ARCHIVE: OK" >/dev/null) || die "SHA256 verification failed for $ARCHIVE"
     ARCHIVE_SHA=$(sha256sum "$WORK_DIR/$ARCHIVE" | awk '{print $1}')
+    say "Checking and extracting the Bitcoin Core archive..."
     tar -tzf "$WORK_DIR/$ARCHIVE" >/dev/null || die "The downloaded archive is invalid"
     tar -xzf "$WORK_DIR/$ARCHIVE" -C "$WORK_DIR"
     [[ -x $WORK_DIR/bitcoin-$VERSION/bin/bitcoind && -x $WORK_DIR/bitcoin-$VERSION/bin/bitcoin-cli && -x $WORK_DIR/bitcoin-$VERSION/bin/bitcoin-wallet ]] || die "The release archive lacks required executable binaries"

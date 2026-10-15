@@ -3,7 +3,7 @@ Type: note
 Description: Entropy39 Node — Debian Installation Complete
  Debian has been installed successfully.
  .
- Please remove the installation USB drive (or eject the ISO if using a virtual machine).
+ Please remove the installation USB drive.
  .
  After rebooting, Entropy39 Node setup will start automatically and install the Dashboard and Bitcoin Core.
  .
