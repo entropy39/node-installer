@@ -24,8 +24,6 @@ prepare_logging() {
     touch "${LOG_DIR}/setup.log"
     chown root:adm "${LOG_DIR}/setup.log"
     chmod 0640 "${LOG_DIR}/setup.log"
-    exec > >(tee -a "${LOG_DIR}/setup.log") 2>&1
-    printf '\n===== Entropy39 first-boot setup: %s =====\n' "$(date --iso-8601=seconds)"
 }
 
 check_environment() {
@@ -186,7 +184,7 @@ failure_menu() {
 }
 
 main() {
-    prepare_logging
+    printf '\n===== Entropy39 first-boot setup: %s =====\n' "$(date --iso-8601=seconds)"
     check_environment
 
     if [[ -f "${COMPLETE_MARKER}" ]]; then
@@ -202,4 +200,11 @@ main() {
     done
 }
 
-main "$@"
+prepare_logging
+
+set +e
+main "$@" 2>&1 | tee -a "${LOG_DIR}/setup.log"
+main_status="${PIPESTATUS[0]}"
+set -e
+
+exit "${main_status}"

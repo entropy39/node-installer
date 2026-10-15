@@ -92,6 +92,8 @@ verify_bitcoin() {
         systemctl is-active --quiet bitcoind.service && \
             die "Bitcoin Core remained active after the verification stop."
     fi
+
+    return 0
 }
 
 mark_complete() {
