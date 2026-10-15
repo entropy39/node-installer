@@ -147,6 +147,7 @@ grep -vE '  [.]?/boot/grub/(grub|debian-grub)[.]cfg$|  [.]?/isolinux/(isolinux|d
 printf '%s  ./boot/grub/grub.cfg\n' "$(md5sum "$CUSTOM_GRUB" | awk '{print $1}')" >>"$NEW_MD5"
 printf '%s  ./boot/grub/debian-grub.cfg\n' "$(md5sum "$ORIGINAL_GRUB" | awk '{print $1}')" >>"$NEW_MD5"
 printf '%s  ./preseed.cfg\n' "$(md5sum "$ROOT_DIR/debian/preseed.cfg" | awk '{print $1}')" >>"$NEW_MD5"
+printf '%s  ./entropy39/finish-install.templates\n' "$(md5sum "$ROOT_DIR/debian/finish-install.templates" | awk '{print $1}')" >>"$NEW_MD5"
 while IFS= read -r file; do
     relative=${file#"$WORK_DIR/"}
     printf '%s  ./entropy39/%s\n' "$(md5sum "$file" | awk '{print $1}')" "$relative" >>"$NEW_MD5"
@@ -154,6 +155,7 @@ done < <(find "$PAYLOAD" -type f -print | sort)
 
 XORRISO_MAP=(
     -map "$ROOT_DIR/debian/preseed.cfg" /preseed.cfg
+    -map "$ROOT_DIR/debian/finish-install.templates" /entropy39/finish-install.templates
     -map "$PAYLOAD" /entropy39/firstboot
     -map "$CUSTOM_GRUB" /boot/grub/grub.cfg
     -map "$ORIGINAL_GRUB" /boot/grub/debian-grub.cfg

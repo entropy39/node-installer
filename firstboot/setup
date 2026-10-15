@@ -114,7 +114,7 @@ mark_complete() {
 
 main() {
     [[ "${EUID}" -eq 0 ]] || die "Entropy39 setup must run as root."
-    [[ -t 0 && -t 1 ]] || die "Entropy39 setup requires an interactive terminal."
+    [[ -t 0 ]] || die "Entropy39 setup requires an interactive terminal."
     [[ -x "${DASHBOARD_INSTALLER}" && -x "${BITCOIN_INSTALLER}" ]] || \
         die "One or more component installers are missing or not executable."
 

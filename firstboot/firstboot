@@ -30,7 +30,7 @@ prepare_logging() {
 
 check_environment() {
     [[ "${EUID}" -eq 0 ]] || die "First-boot setup must run as root."
-    [[ -t 0 && -t 1 ]] || die "First-boot setup requires an interactive console."
+    [[ -t 0 ]] || die "First-boot setup requires an interactive console."
     [[ "$(tty)" == "/dev/tty1" ]] || die "First-boot setup may run only on the local tty1 console."
     for command_name in curl git install systemctl tee; do
         command -v "${command_name}" >/dev/null 2>&1 || die "Required command not found: ${command_name}"
@@ -61,6 +61,27 @@ remove_interrupted_staging() {
     }
     log "Removing an interrupted installer download"
     rm -rf -- "${STAGING_DIR}"
+}
+
+wait_for_network() {
+    local -r timeout=120
+    local -r retry_interval=5
+    local -r check_url="https://github.com/"
+    local deadline
+
+    deadline=$((SECONDS + timeout))
+    log "Waiting for DNS and GitHub connectivity"
+    while ((SECONDS < deadline)); do
+        if curl --fail --silent --location \
+            --connect-timeout 5 --max-time 10 \
+            --output /dev/null "${check_url}"; then
+            log "Network connectivity is ready"
+            return 0
+        fi
+        sleep "${retry_interval}"
+    done
+
+    die "Network connectivity to GitHub was not ready after ${timeout} seconds."
 }
 
 recover_interrupted_checkout() {
@@ -104,6 +125,7 @@ retrieve_installer() {
     fi
 
     log "Retrieving the current Entropy39 installer as one Git commit"
+    wait_for_network || return 1
     remove_interrupted_staging || return 1
     install -d -o root -g root -m 0700 "${STAGING_DIR}"
     touch "${STAGING_MARKER}"
@@ -154,7 +176,7 @@ failure_menu() {
             1) return 0 ;;
             2)
                 printf 'Type exit to return to the Entropy39 recovery menu.\n'
-                /bin/bash -l
+                /bin/bash --login -i
                 ;;
             3) systemctl reboot; exit 0 ;;
             4) systemctl poweroff; exit 0 ;;
