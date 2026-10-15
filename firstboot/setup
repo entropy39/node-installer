@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
-umask 077
+umask 022
 
 readonly SOURCE_DIR="/usr/local/lib/node-installer"
 readonly STATE_DIR="/var/lib/entropy39-node"
