@@ -4,6 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 PROGRAM=${0##*/}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BITCOIN_USER=bitcoin
 BITCOIN_GROUP=bitcoin
 BITCOIN_HOME=/var/lib/bitcoin
@@ -27,10 +28,10 @@ FULL_BLOCKCHAIN_GB_FALLBACK=600
 FULL_MONTHLY_GROWTH_GB_FALLBACK=10
 FULL_ESTIMATE_AS_OF=2026-10-13
 
-DASHBOARD_BITCOIN_TEMPLATES=/srv/www/dashboard/docs/examples/bitcoin
-BITCOIN_CONF_TEMPLATE=$DASHBOARD_BITCOIN_TEMPLATES/bitcoin.conf
-SERVICE_TEMPLATE=$DASHBOARD_BITCOIN_TEMPLATES/bitcoind.service
-LOGROTATE_TEMPLATE=$DASHBOARD_BITCOIN_TEMPLATES/bitcoin.logrotate
+BITCOIN_TEMPLATES=$SCRIPT_DIR/templates/bitcoin
+BITCOIN_CONF_TEMPLATE=$BITCOIN_TEMPLATES/bitcoin.conf
+SERVICE_TEMPLATE=$BITCOIN_TEMPLATES/bitcoind.service
+LOGROTATE_TEMPLATE=$BITCOIN_TEMPLATES/bitcoin.logrotate
 
 # Entropy39 trusted Bitcoin Core release signers.
 #
@@ -161,7 +162,7 @@ require_commands() {
 preflight_templates() {
     local template
     for template in "$BITCOIN_CONF_TEMPLATE" "$SERVICE_TEMPLATE" "$LOGROTATE_TEMPLATE"; do
-        [[ -f $template ]] || die "Missing authoritative Dashboard template: $template"
+        [[ -f $template ]] || die "Missing authoritative Bitcoin Core installer template: $template"
     done
     [[ -f $DASHBOARD_RPC ]] || die "The Entropy39 Dashboard RPC configuration is missing: $DASHBOARD_RPC"
 

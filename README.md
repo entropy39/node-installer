@@ -15,10 +15,9 @@ Debian preseed and reproducible ISO construction tooling.
 - `debian/` contains the Debian Installer preseed configuration.
 - `scripts/` contains the ISO builder.
 
-The Dashboard configuration templates remain authoritative in the Dashboard
-repository and are installed with the Dashboard application. The Bitcoin Core
-installer reads those installed templates from
-`/srv/www/dashboard/docs/examples/bitcoin/`.
+The Bitcoin Core configuration templates are maintained beside their installer
+under `installers/templates/bitcoin/`. Other application configuration templates
+remain authoritative in the Dashboard repository.
 
 ## First-boot flow
 

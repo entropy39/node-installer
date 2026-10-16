@@ -1,0 +1,18 @@
+[Unit]
+Description=Bitcoin daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bitcoin
+Group=bitcoin
+
+ExecStart=/usr/local/bin/bitcoind -conf=/etc/bitcoin.conf
+ExecStop=/usr/local/bin/bitcoin-cli -conf=/etc/bitcoin.conf stop
+
+Type=exec
+Restart=on-failure
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

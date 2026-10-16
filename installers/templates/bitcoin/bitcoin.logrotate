@@ -1,0 +1,11 @@
+/var/log/bitcoin/debug.log {
+    su bitcoin bitcoin
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 640 bitcoin bitcoin
+}
