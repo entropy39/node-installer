@@ -354,7 +354,7 @@ verify_installation() {
 
     dashboard_page="$(curl --fail --show-error --silent http://127.0.0.1/)" || \
         die "The dashboard did not return a successful HTTP response."
-    grep -Fq '<title>Bitcoin Node</title>' <<<"${dashboard_page}" || \
+    grep -Fq '<title>Entropy39</title>' <<<"${dashboard_page}" || \
         die "The HTTP response did not contain the expected dashboard page."
 
     status_json="$(curl --fail --show-error --silent \
