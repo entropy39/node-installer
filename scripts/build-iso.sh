@@ -53,7 +53,7 @@ case $ARCHITECTURE in
     *) die "Supported architectures are arm64 and amd64" ;;
 esac
 
-for command_name in awk curl find gpg grep md5sum sed sha512sum sort xorriso; do
+for command_name in awk curl find git gpg grep md5sum sed sha256sum sha512sum sort xorriso; do
     command -v "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
 done
 
@@ -142,6 +142,16 @@ for file in \
     cp "$ROOT_DIR/firstboot/$file" "$PAYLOAD/$file"
 done
 
+INSTALLER_SNAPSHOT=$WORK_DIR/node-installer
+SNAPSHOT_INFO=$WORK_DIR/installer-snapshot-info
+"$ROOT_DIR/scripts/stage-installer-snapshot.sh" "$INSTALLER_SNAPSHOT" >"$SNAPSHOT_INFO"
+INSTALLER_COMMIT=$(sed -n 's/^installer_commit=//p' "$SNAPSHOT_INFO")
+INSTALLER_DIRTY=$(sed -n 's/^installer_dirty=//p' "$SNAPSHOT_INFO")
+INSTALLER_SNAPSHOT_SHA256=$(sed -n 's/^installer_snapshot_sha256=//p' "$SNAPSHOT_INFO")
+[[ $INSTALLER_COMMIT =~ ^[0-9a-f]{40}$ ]] || die "Installer snapshot has an invalid Git commit"
+[[ $INSTALLER_DIRTY == yes || $INSTALLER_DIRTY == no ]] || die "Installer snapshot has an invalid dirty state"
+[[ $INSTALLER_SNAPSHOT_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "Installer snapshot has an invalid digest"
+
 NEW_MD5=$WORK_DIR/md5sum.new
 grep -vE '  [.]?/boot/grub/(grub|debian-grub)[.]cfg$|  [.]?/isolinux/(isolinux|debian-isolinux)[.]cfg$|  [.]?/preseed[.]cfg$|  [.]?/entropy39/' "$ORIGINAL_MD5" >"$NEW_MD5"
 printf '%s  ./boot/grub/grub.cfg\n' "$(md5sum "$CUSTOM_GRUB" | awk '{print $1}')" >>"$NEW_MD5"
@@ -152,11 +162,16 @@ while IFS= read -r file; do
     relative=${file#"$WORK_DIR/"}
     printf '%s  ./entropy39/%s\n' "$(md5sum "$file" | awk '{print $1}')" "$relative" >>"$NEW_MD5"
 done < <(find "$PAYLOAD" -type f -print | sort)
+while IFS= read -r file; do
+    relative=${file#"$INSTALLER_SNAPSHOT/"}
+    printf '%s  ./entropy39/node-installer/%s\n' "$(md5sum "$file" | awk '{print $1}')" "$relative" >>"$NEW_MD5"
+done < <(find "$INSTALLER_SNAPSHOT" -type f -print | sort)
 
 XORRISO_MAP=(
     -map "$ROOT_DIR/debian/preseed.cfg" /preseed.cfg
     -map "$ROOT_DIR/debian/finish-install.templates" /entropy39/finish-install.templates
     -map "$PAYLOAD" /entropy39/firstboot
+    -map "$INSTALLER_SNAPSHOT" /entropy39/node-installer
     -map "$CUSTOM_GRUB" /boot/grub/grub.cfg
     -map "$ORIGINAL_GRUB" /boot/grub/debian-grub.cfg
     -map "$NEW_MD5" /md5sum.txt
@@ -204,6 +219,9 @@ sha512sum "$OUTPUT_ISO" >"$OUTPUT_ISO.sha512"
     printf 'debian_sha512=%s\n' "$EXPECTED_SHA512"
     printf 'debian_cd_signing_fingerprint=%s\n' "$DEBIAN_CD_KEY_FINGERPRINT"
     printf 'architecture=%s\n' "$ARCHITECTURE"
+    printf 'installer_commit=%s\n' "$INSTALLER_COMMIT"
+    printf 'installer_dirty=%s\n' "$INSTALLER_DIRTY"
+    printf 'installer_snapshot_sha256=%s\n' "$INSTALLER_SNAPSHOT_SHA256"
     printf 'built_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$OUTPUT_ISO.build-info"
 

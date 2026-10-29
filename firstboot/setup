@@ -1,148 +1,405 @@
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 umask 022
 
-readonly SOURCE_DIR="/usr/local/lib/node-installer"
-readonly STATE_DIR="/var/lib/entropy39-node"
-readonly COMPLETE_MARKER="${STATE_DIR}/setup-complete"
-readonly INSTALLER_COMMIT_RECORD="${STATE_DIR}/installer-commit"
-readonly DASHBOARD_INSTALLER="${SOURCE_DIR}/installers/install-dashboard.sh"
-readonly BITCOIN_INSTALLER="${SOURCE_DIR}/installers/install-bitcoin-core.sh"
-readonly DASHBOARD_DIR="/srv/www/dashboard"
-readonly DASHBOARD_COMMIT_RECORD="${STATE_DIR}/dashboard-installed-commit"
+readonly SOURCE_DIR=/usr/local/lib/node-installer
+readonly STATE_DIR=/var/lib/entropy39-node
+readonly COMPLETE_MARKER=$STATE_DIR/setup-complete
+readonly BASE_COMPLETE_MARKER=$STATE_DIR/base-install-complete
+readonly APP_SELECTION_RECORD=$STATE_DIR/selected-apps
+readonly APPS_CONFIGURED_RECORD=$STATE_DIR/optional-apps-configured
+readonly APPS_COMPLETE_RECORD=$STATE_DIR/optional-apps-complete
+readonly INSTALLER_COMMIT_RECORD=$STATE_DIR/installer-commit
+readonly INSTALLER_DIRTY_RECORD=$STATE_DIR/installer-dirty
+readonly INSTALLER_SNAPSHOT_RECORD=$STATE_DIR/installer-snapshot-sha256
+readonly DASHBOARD_INSTALLER=$SOURCE_DIR/installers/install-dashboard.sh
+readonly BITCOIN_INSTALLER=$SOURCE_DIR/installers/install-bitcoin-core.sh
+readonly APP_CATALOG=$SOURCE_DIR/firstboot/app-catalog.sh
+readonly DASHBOARD_DIR=/srv/www/dashboard
+readonly DASHBOARD_COMMIT_RECORD=$STATE_DIR/dashboard-installed-commit
+
+ACTIVE_PASSWORD_FILE=
+PASSWORD_FILE_RESULT=
+NODE_MODE=
+SELECTED_APPS=()
+CONFIGURED_APPS=()
+FAILED_APPS=()
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
 
+cleanup_password_file() {
+    if [[ -n $ACTIVE_PASSWORD_FILE && -f $ACTIVE_PASSWORD_FILE && ! -L $ACTIVE_PASSWORD_FILE ]]; then
+        rm -f -- "$ACTIVE_PASSWORD_FILE"
+    fi
+    ACTIVE_PASSWORD_FILE=
+}
+
+atomic_write_record() {
+    local target=$1 mode=$2 temporary
+    temporary=${target}.new
+    shift 2
+    install -d -o root -g root -m 0755 "$(dirname "$target")"
+    umask 077
+    if (($#)); then printf '%s\n' "$@" >"$temporary"; else : >"$temporary"; fi
+    chown root:root "$temporary"
+    chmod "$mode" "$temporary"
+    mv -f -- "$temporary" "$target"
+    umask 022
+}
+
+join_apps() { local IFS=,; if (($#)); then printf '%s' "$*"; else printf none; fi; }
+
+record_value() {
+    local record=$1 key=$2
+    [[ $(grep -c "^${key}=" "$record") -eq 1 ]] || return 1
+    sed -n "s/^${key}=//p" "$record"
+}
+
+load_app_value() {
+    local record=$1 key=$2 destination=$3 value
+    local output
+    value=$(record_value "$record" "$key") || return 1
+    if [[ $value == none ]]; then
+        case $destination in
+            SELECTED_APPS) SELECTED_APPS=() ;;
+            CONFIGURED_APPS) CONFIGURED_APPS=() ;;
+            FAILED_APPS) FAILED_APPS=() ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
+    IFS=, read -r -a output <<<"$value"
+    case $destination in
+        SELECTED_APPS) SELECTED_APPS=("${output[@]}") ;;
+        CONFIGURED_APPS) CONFIGURED_APPS=("${output[@]}") ;;
+        FAILED_APPS) FAILED_APPS=("${output[@]}") ;;
+        *) return 1 ;;
+    esac
+}
+
 dashboard_is_verified() {
     local actual_commit recorded_commit
-
-    [[ -d "${DASHBOARD_DIR}/.git" && -f "${DASHBOARD_COMMIT_RECORD}" ]] || return 1
-    read -r recorded_commit <"${DASHBOARD_COMMIT_RECORD}" || return 1
-    [[ "${recorded_commit}" =~ ^[0-9a-f]{40}$ ]] || return 1
-    actual_commit="$(git -C "${DASHBOARD_DIR}" rev-parse HEAD 2>/dev/null)" || return 1
-    [[ "${actual_commit}" == "${recorded_commit}" ]] || return 1
-    [[ -f "${DASHBOARD_DIR}/config/bitcoin-rpc.php" ]] || return 1
+    [[ -d $DASHBOARD_DIR/.git && -f $DASHBOARD_COMMIT_RECORD ]] || return 1
+    read -r recorded_commit <"$DASHBOARD_COMMIT_RECORD" || return 1
+    [[ $recorded_commit =~ ^[0-9a-f]{40}$ ]] || return 1
+    actual_commit=$(git -C "$DASHBOARD_DIR" rev-parse HEAD 2>/dev/null) || return 1
+    [[ $actual_commit == "$recorded_commit" ]] || return 1
+    [[ -f $DASHBOARD_DIR/config/bitcoin-rpc.php ]] || return 1
     systemctl is-active --quiet apache2.service || return 1
     systemctl is-active --quiet shutdownd.service || return 1
     curl --fail --silent --show-error http://127.0.0.1/ >/dev/null || return 1
 }
 
-verify_dashboard() {
-    local actual_commit recorded_commit
-
-    [[ -d "${DASHBOARD_DIR}/.git" ]] || die "Dashboard Git metadata is missing."
-    [[ -f "${DASHBOARD_COMMIT_RECORD}" ]] || die "The Dashboard commit record is missing."
-    read -r recorded_commit <"${DASHBOARD_COMMIT_RECORD}" || die "Cannot read the Dashboard commit record."
-    actual_commit="$(git -C "${DASHBOARD_DIR}" rev-parse HEAD 2>/dev/null)" || \
-        die "Cannot determine the installed Dashboard commit."
-    [[ "${actual_commit}" == "${recorded_commit}" ]] || \
-        die "The installed Dashboard does not match its recorded commit."
-    [[ -f "${DASHBOARD_DIR}/config/bitcoin-rpc.php" ]] || die "Dashboard RPC configuration is missing."
-    systemctl is-active --quiet apache2.service || die "Apache2 is not active."
-    systemctl is-active --quiet shutdownd.service || die "The Dashboard shutdown service is not active."
-    curl --fail --silent --show-error http://127.0.0.1/ >/dev/null || \
-        die "The Dashboard did not return a successful local HTTP response."
-}
+verify_dashboard() { dashboard_is_verified || die "Dashboard installation verification failed."; }
 
 bitcoin_is_complete() {
-    [[ ! -e "${STATE_DIR}/bitcoin-core-install-incomplete" ]] || return 1
-    [[ -f /etc/bitcoin.conf && -f /etc/systemd/system/bitcoind.service ]] || return 1
+    [[ ! -e $STATE_DIR/bitcoin-core-install-incomplete ]] || return 1
+    [[ -f /etc/bitcoin.conf && ! -L /etc/bitcoin.conf ]] || return 1
+    [[ -f /etc/systemd/system/bitcoind.service ]] || return 1
     [[ -x /usr/local/bin/bitcoind && -x /usr/local/bin/bitcoin-cli ]] || return 1
     [[ -L /usr/local/bin/bitcoind && -L /usr/local/bin/bitcoin-cli ]] || return 1
     [[ -d /var/lib/bitcoin ]] || return 1
-    systemctl is-enabled --quiet bitcoind.service || return 1
-    ! grep -Fq 'RPC-PASSWORD-HERE' "${DASHBOARD_DIR}/config/bitcoin-rpc.php"
+    ! grep -Fq RPC-PASSWORD-HERE "$DASHBOARD_DIR/config/bitcoin-rpc.php"
 }
 
-verify_bitcoin() {
-    local attempt conf_mode conf_owner home_owner started_for_verification=no
-
-    bitcoin_is_complete || die "Bitcoin Core installation verification failed."
-    conf_mode="$(stat -c '%a' /etc/bitcoin.conf)"
-    conf_owner="$(stat -c '%U:%G' /etc/bitcoin.conf)"
-    home_owner="$(stat -c '%U:%G' /var/lib/bitcoin)"
-    [[ "${conf_mode}" == "640" && "${conf_owner}" == "root:bitcoin" ]] || \
-        die "Unexpected /etc/bitcoin.conf permissions or ownership."
-    [[ "${home_owner}" == "bitcoin:bitcoin" ]] || die "Unexpected /var/lib/bitcoin ownership."
-    grep -Eq '^rpcauth=dashboard:' /etc/bitcoin.conf || die "Dashboard rpcauth is missing from bitcoin.conf."
-    if ! systemctl is-active --quiet bitcoind.service; then
-        log "Starting Bitcoin Core to verify the installation"
-        systemctl start bitcoind.service || {
-            systemctl status bitcoind.service --no-pager >&2 || true
-            die "Bitcoin Core failed to start."
-        }
-        started_for_verification=yes
-    fi
-
-    for ((attempt = 0; attempt < 20; attempt++)); do
-        if systemctl is-active --quiet bitcoind.service && \
-            ! systemctl is-failed --quiet bitcoind.service; then
-            sleep 0.5
-            continue
-        fi
-        systemctl status bitcoind.service --no-pager >&2 || true
-        die "Bitcoin Core did not remain active during startup verification."
+detect_node_mode() {
+    local values=() value
+    while IFS= read -r value; do values+=("$value"); done < <(
+        sed -n 's/^[[:space:]]*prune[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' /etc/bitcoin.conf
+    )
+    if ((${#values[@]} == 0)); then NODE_MODE=full; return; fi
+    for value in "${values[@]}"; do
+        [[ $value == "${values[0]}" ]] || die "bitcoin.conf contains conflicting prune settings."
     done
+    if ((10#${values[0]} > 0)); then NODE_MODE=pruned; else NODE_MODE=full; fi
+}
 
-    if [[ "${started_for_verification}" == "yes" ]]; then
-        log "Bitcoin Core startup verified; restoring the requested stopped state"
-        systemctl stop bitcoind.service || die "Bitcoin Core started successfully but could not be stopped after verification."
-        systemctl is-active --quiet bitcoind.service && \
-            die "Bitcoin Core remained active after the verification stop."
+bitcoin_configuration_is_safe() {
+    [[ -f /etc/bitcoin.conf && ! -L /etc/bitcoin.conf ]] || return 1
+    [[ $(stat -c '%U:%G:%a' /etc/bitcoin.conf) == root:bitcoin:640 ]] || return 1
+    runuser -u bitcoin -- test -r /etc/bitcoin.conf || return 1
+    [[ $(grep -c '^rpcauth=dashboard:' /etc/bitcoin.conf) -eq 1 ]] || return 1
+    ! grep -Fq RPC-PASSWORD-HERE /etc/bitcoin.conf || return 1
+    awk '
+        /^[[:space:]]*rpcauth=/ {
+            if ($0 !~ /^[[:space:]]*rpcauth=[A-Za-z0-9_.-]+:[0-9a-fA-F]+\$[0-9a-fA-F]+[[:space:]]*$/) exit 1
+            line=$0; sub(/^[[:space:]]*rpcauth=/, "", line); sub(/:.*/, "", line)
+            if (seen[line]++) exit 1
+        }
+    ' /etc/bitcoin.conf || return 1
+    detect_node_mode || return 1
+    if [[ $NODE_MODE == pruned ]] && grep -Eq '^[[:space:]]*txindex[[:space:]]*=[[:space:]]*1[[:space:]]*$' /etc/bitcoin.conf; then return 1; fi
+}
+
+verify_bitcoin_installed() {
+    bitcoin_is_complete || die "Bitcoin Core installation verification failed."
+    bitcoin_configuration_is_safe || die "Bitcoin Core configuration safety checks failed."
+    [[ $(stat -c '%U:%G' /var/lib/bitcoin) == bitcoin:bitcoin ]] || die "Unexpected /var/lib/bitcoin ownership."
+}
+
+ensure_bitcoin_stopped() {
+    if systemctl is-active --quiet bitcoind.service || pgrep -x bitcoind >/dev/null 2>&1; then
+        log "Stopping Bitcoin Core until optional application configuration is complete"
+        systemctl stop bitcoind.service || die "Bitcoin Core could not be stopped."
     fi
+    ! systemctl is-active --quiet bitcoind.service || die "Bitcoin Core remained active."
+    ! pgrep -x bitcoind >/dev/null 2>&1 || die "A bitcoind process remained active."
+    systemctl disable bitcoind.service >/dev/null || die "Bitcoin Core could not be disabled during configuration."
+}
 
-    return 0
+mark_base_complete() {
+    [[ -f $BASE_COMPLETE_MARKER ]] && return 0
+    local installer_commit installer_dirty installer_snapshot dashboard_commit bitcoin_version
+    installer_commit=$(<"$INSTALLER_COMMIT_RECORD")
+    installer_dirty=$(<"$INSTALLER_DIRTY_RECORD")
+    installer_snapshot=$(<"$INSTALLER_SNAPSHOT_RECORD")
+    dashboard_commit=$(<"$DASHBOARD_COMMIT_RECORD")
+    bitcoin_version=$(/usr/local/bin/bitcoind --version | awk 'NR == 1 { print $4; exit }')
+    atomic_write_record "$BASE_COMPLETE_MARKER" 0644 \
+        "completed=$(date --iso-8601=seconds)" "installer_commit=$installer_commit" \
+        "installer_dirty=$installer_dirty" "installer_snapshot_sha256=$installer_snapshot" \
+        "dashboard_commit=$dashboard_commit" "bitcoin_core_version=$bitcoin_version" "node_mode=$NODE_MODE"
+}
+
+load_or_choose_apps() {
+    local app choice_file
+    local available=() checklist=()
+    if [[ -f $APP_SELECTION_RECORD ]]; then
+        while IFS= read -r app; do [[ -z $app ]] || SELECTED_APPS+=("$app"); done <"$APP_SELECTION_RECORD"
+        validate_app_list "$NODE_MODE" "${SELECTED_APPS[@]}" || die "The saved optional application selection is invalid."
+        return
+    fi
+    while IFS= read -r app; do available+=("$app"); done < <(available_apps_for_mode "$NODE_MODE")
+    choice_file=$(mktemp "$STATE_DIR/app-selection.XXXXXX")
+    chmod 0600 "$choice_file"
+    for app in "${available[@]}"; do checklist+=("$app" "$(app_description "$app")" OFF); done
+    while true; do
+        : >"$choice_file"
+        if whiptail --title "Entropy39 optional applications" --separate-output --checklist \
+                "Select applications to install. Nothing is selected by default." 20 78 10 \
+                "${checklist[@]}" 2>"$choice_file"; then
+            SELECTED_APPS=()
+            while IFS= read -r app; do
+                app=${app#\"}; app=${app%\"}
+                [[ -z $app ]] || SELECTED_APPS+=("$app")
+            done <"$choice_file"
+            validate_app_list "$NODE_MODE" "${SELECTED_APPS[@]}" || { rm -f -- "$choice_file"; die "whiptail returned an invalid application selection."; }
+            break
+        fi
+        if whiptail --title "No optional applications" --yesno "Continue without installing optional applications?" 9 62; then
+            SELECTED_APPS=(); break
+        fi
+    done
+    rm -f -- "$choice_file"
+    atomic_write_record "$APP_SELECTION_RECORD" 0644 "${SELECTED_APPS[@]}"
+}
+
+prompt_explorer_password() {
+    local password_file confirmation_file
+    password_file=$(mktemp "$STATE_DIR/explorer-password.XXXXXX")
+    confirmation_file=$(mktemp "$STATE_DIR/explorer-password-confirm.XXXXXX")
+    chmod 0600 "$password_file" "$confirmation_file"
+    ACTIVE_PASSWORD_FILE=$password_file
+    while true; do
+        : >"$password_file"; : >"$confirmation_file"
+        whiptail --title "BTC RPC Explorer" --passwordbox "Set the Explorer web password:" 10 68 2>"$password_file" || {
+            rm -f -- "$password_file" "$confirmation_file"; ACTIVE_PASSWORD_FILE=; return 1;
+        }
+        [[ -s $password_file ]] || { whiptail --title "Invalid password" --msgbox "The Explorer password cannot be empty." 8 54; continue; }
+        whiptail --title "BTC RPC Explorer" --passwordbox "Confirm the Explorer web password:" 10 68 2>"$confirmation_file" || continue
+        if cmp -s "$password_file" "$confirmation_file"; then break; fi
+        whiptail --title "Passwords do not match" --msgbox "The Explorer passwords did not match. Please try again." 8 62
+    done
+    rm -f -- "$confirmation_file"
+    PASSWORD_FILE_RESULT=$password_file
+}
+
+explorer_is_configured() {
+    local actual_commit recorded_commit
+    [[ ! -e $STATE_DIR/explorer-install-incomplete ]] || return 1
+    [[ -d /usr/local/lib/btc-rpc-explorer/.git && -f $STATE_DIR/explorer-installed-commit ]] || return 1
+    recorded_commit=$(<"$STATE_DIR/explorer-installed-commit")
+    [[ $recorded_commit =~ ^[0-9a-f]{40}$ ]] || return 1
+    actual_commit=$(git -C /usr/local/lib/btc-rpc-explorer rev-parse HEAD 2>/dev/null) || return 1
+    [[ $actual_commit == "$recorded_commit" ]] || return 1
+    [[ -f /etc/btc-rpc-explorer.env && ! -L /etc/btc-rpc-explorer.env ]] || return 1
+    [[ $(stat -c '%U:%G:%a' /etc/btc-rpc-explorer.env) == root:explorer:640 ]] || return 1
+    [[ -f /etc/systemd/system/explorer.service ]] || return 1
+    [[ $(grep -c '^rpcauth=explorer:' /etc/bitcoin.conf) -eq 1 ]]
+}
+
+install_explorer() {
+    local installer password_file status
+    installer=$SOURCE_DIR/$(app_installer explorer)
+    if explorer_is_configured; then log "Existing BTC RPC Explorer installation verified; installation is not being repeated"; return 0; fi
+    if [[ -e $STATE_DIR/explorer-install-incomplete ]]; then "$installer" --install; return; fi
+    prompt_explorer_password || return 1
+    password_file=$PASSWORD_FILE_RESULT
+    ACTIVE_PASSWORD_FILE=$password_file
+    if "$installer" --install --password-file "$password_file"; then status=0; else status=$?; fi
+    cleanup_password_file
+    return "$status"
+}
+
+app_is_configured() { case $1 in explorer) explorer_is_configured ;; *) return 1 ;; esac; }
+install_app() { case $1 in explorer) install_explorer ;; *) die "No installer dispatcher exists for optional application: $1" ;; esac; }
+
+optional_failure_is_safe() {
+    local app=$1 service
+    service=$(app_service "$app")
+    systemctl disable --now "$service" >/dev/null 2>&1 || true
+    ! systemctl is-active --quiet "$service" || return 1
+    bitcoin_configuration_is_safe
+}
+
+optional_failure_menu() {
+    local app=$1 choice
+    while true; do
+        choice=$(whiptail --title "Optional application failed" --menu \
+            "$(app_label "$app") did not complete successfully. You may retry it or continue without it." 18 78 7 \
+            retry "Retry the application installer" continue "Continue without this application and start Bitcoin Core" \
+            shell "Open a root maintenance shell" reboot "Reboot" shutdown "Shut down" 3>&1 1>&2 2>&3) || continue
+        case $choice in
+            retry) return 0 ;;
+            continue)
+                optional_failure_is_safe "$app" || { whiptail --title "Configuration not safe" --msgbox \
+                    "Bitcoin Core cannot be started because a safe configuration state could not be confirmed." 10 72; continue; }
+                return 1 ;;
+            shell) printf 'Type exit to return to the optional application recovery menu.\n'; /bin/bash --login -i ;;
+            reboot) systemctl reboot; exit 0 ;;
+            shutdown) systemctl poweroff; exit 0 ;;
+        esac
+    done
+}
+
+configure_selected_apps() {
+    local app retry expected_selection seen=" "
+    if [[ -f $APPS_CONFIGURED_RECORD ]]; then
+        expected_selection=$(join_apps "${SELECTED_APPS[@]}")
+        load_app_value "$APPS_CONFIGURED_RECORD" selected SELECTED_APPS || die "Cannot read saved optional app selection."
+        load_app_value "$APPS_CONFIGURED_RECORD" configured CONFIGURED_APPS || die "Cannot read configured app record."
+        load_app_value "$APPS_CONFIGURED_RECORD" failed FAILED_APPS || die "Cannot read failed app record."
+        [[ $(join_apps "${SELECTED_APPS[@]}") == "$expected_selection" ]] || die "Optional application state does not match the saved selection."
+        validate_app_list "$NODE_MODE" "${SELECTED_APPS[@]}" || die "The configured application record is invalid."
+        validate_app_list "$NODE_MODE" "${CONFIGURED_APPS[@]}" || die "The configured application list is invalid."
+        validate_app_list "$NODE_MODE" "${FAILED_APPS[@]}" || die "The failed application list is invalid."
+        for app in "${CONFIGURED_APPS[@]}" "${FAILED_APPS[@]}"; do
+            [[ $seen != *" $app "* ]] || die "An optional application has duplicate state."
+            seen+="$app "
+        done
+        ((${#CONFIGURED_APPS[@]} + ${#FAILED_APPS[@]} == ${#SELECTED_APPS[@]})) || die "Optional application state is incomplete."
+        return
+    fi
+    CONFIGURED_APPS=(); FAILED_APPS=()
+    for app in "${SELECTED_APPS[@]}"; do
+        while true; do
+            log "Installing and configuring $(app_label "$app")"
+            if install_app "$app" && app_is_configured "$app"; then CONFIGURED_APPS+=("$app"); break; fi
+            retry=yes; optional_failure_menu "$app" || retry=no
+            if [[ $retry == no ]]; then FAILED_APPS+=("$app"); break; fi
+        done
+    done
+    atomic_write_record "$APPS_CONFIGURED_RECORD" 0644 "completed=$(date --iso-8601=seconds)" \
+        "selected=$(join_apps "${SELECTED_APPS[@]}")" "configured=$(join_apps "${CONFIGURED_APPS[@]}")" \
+        "failed=$(join_apps "${FAILED_APPS[@]}")"
+}
+
+start_and_verify_bitcoin() {
+    local attempt
+    bitcoin_configuration_is_safe || die "Bitcoin Core configuration safety checks failed before startup."
+    log "Starting Bitcoin Core; initial block download will continue in the background"
+    systemctl enable bitcoind.service >/dev/null || die "Bitcoin Core could not be enabled."
+    systemctl start bitcoind.service || { systemctl status bitcoind.service --no-pager >&2 || true; die "Bitcoin Core failed to start."; }
+    for ((attempt=0; attempt<20; attempt++)); do
+        if systemctl is-active --quiet bitcoind.service && ! systemctl is-failed --quiet bitcoind.service; then sleep 0.5; continue; fi
+        systemctl status bitcoind.service --no-pager >&2 || true; die "Bitcoin Core did not remain active during startup verification."
+    done
+}
+
+start_and_verify_app() {
+    local app=$1 attempt code= service
+    service=$(app_service "$app")
+    systemctl enable "$service" >/dev/null || die "${service} could not be enabled."
+    systemctl start "$service" || { systemctl status "$service" --no-pager >&2 || true; die "$(app_label "$app") failed to start."; }
+    case $app in
+        explorer)
+            for ((attempt=0; attempt<60; attempt++)); do
+                code=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3002/ || true)
+                [[ $code == 200 || $code == 401 ]] && break
+                sleep 1
+            done
+            systemctl is-active --quiet "$service" || die "BTC RPC Explorer did not remain active."
+            if [[ $code == 200 || $code == 401 ]]; then
+                code=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:4082/ || true)
+                [[ $code == 200 || $code == 401 ]] || die "The Explorer Apache proxy did not respond successfully."
+            else
+                log "BTC RPC Explorer is active but is still waiting for Bitcoin Core; it can become HTTP-ready as Core proceeds through IBD"
+            fi
+            ;;
+        *) die "No runtime verifier exists for optional application: $app" ;;
+    esac
+}
+
+start_configured_apps() {
+    local app retry kept=()
+    for app in "${CONFIGURED_APPS[@]}"; do
+        while true; do
+            log "Starting $(app_label "$app")"
+            if start_and_verify_app "$app"; then kept+=("$app"); break; fi
+            retry=yes; optional_failure_menu "$app" || retry=no
+            if [[ $retry == no ]]; then FAILED_APPS+=("$app"); break; fi
+        done
+    done
+    CONFIGURED_APPS=("${kept[@]}")
+    atomic_write_record "$APPS_COMPLETE_RECORD" 0644 "completed=$(date --iso-8601=seconds)" \
+        "selected=$(join_apps "${SELECTED_APPS[@]}")" "installed=$(join_apps "${CONFIGURED_APPS[@]}")" \
+        "failed=$(join_apps "${FAILED_APPS[@]}")"
 }
 
 mark_complete() {
-    local installer_commit dashboard_commit bitcoin_version temporary_marker
-
-    installer_commit="$(<"${INSTALLER_COMMIT_RECORD}")"
-    dashboard_commit="$(<"${DASHBOARD_COMMIT_RECORD}")"
-    bitcoin_version="$(/usr/local/bin/bitcoind --version | awk 'NR == 1 { print $4; exit }')"
-    temporary_marker="${COMPLETE_MARKER}.new"
-    {
-        printf 'completed=%s\n' "$(date --iso-8601=seconds)"
-        printf 'installer_commit=%s\n' "${installer_commit}"
-        printf 'dashboard_commit=%s\n' "${dashboard_commit}"
-        printf 'bitcoin_core_version=%s\n' "${bitcoin_version}"
-    } >"${temporary_marker}"
-    chown root:root "${temporary_marker}"
-    chmod 0644 "${temporary_marker}"
-    mv "${temporary_marker}" "${COMPLETE_MARKER}"
+    local installer_commit installer_dirty installer_snapshot dashboard_commit bitcoin_version setup_status=complete
+    ((${#FAILED_APPS[@]} == 0)) || setup_status=complete-with-optional-failures
+    installer_commit=$(<"$INSTALLER_COMMIT_RECORD"); installer_dirty=$(<"$INSTALLER_DIRTY_RECORD")
+    installer_snapshot=$(<"$INSTALLER_SNAPSHOT_RECORD"); dashboard_commit=$(<"$DASHBOARD_COMMIT_RECORD")
+    bitcoin_version=$(/usr/local/bin/bitcoind --version | awk 'NR == 1 { print $4; exit }')
+    atomic_write_record "$COMPLETE_MARKER" 0644 "completed=$(date --iso-8601=seconds)" "status=$setup_status" \
+        "installer_commit=$installer_commit" "installer_dirty=$installer_dirty" \
+        "installer_snapshot_sha256=$installer_snapshot" "dashboard_commit=$dashboard_commit" "bitcoin_core_version=$bitcoin_version" \
+        "node_mode=$NODE_MODE" "selected_apps=$(join_apps "${SELECTED_APPS[@]}")" \
+        "installed_apps=$(join_apps "${CONFIGURED_APPS[@]}")" "failed_apps=$(join_apps "${FAILED_APPS[@]}")"
 }
 
 main() {
-    [[ "${EUID}" -eq 0 ]] || die "Entropy39 setup must run as root."
+    [[ $EUID -eq 0 ]] || die "Entropy39 setup must run as root."
     [[ -t 0 ]] || die "Entropy39 setup requires an interactive terminal."
-    [[ -x "${DASHBOARD_INSTALLER}" && -x "${BITCOIN_INSTALLER}" ]] || \
-        die "One or more component installers are missing or not executable."
-
+    [[ -x $DASHBOARD_INSTALLER && -x $BITCOIN_INSTALLER ]] || die "One or more base installers are missing or not executable."
+    [[ -r $APP_CATALOG ]] || die "The optional application catalog is missing."
+    command -v whiptail >/dev/null 2>&1 || die "whiptail is required for optional application setup."
+    # shellcheck source=app-catalog.sh
+    source "$APP_CATALOG"
     exec 9>/run/lock/entropy39-setup.lock
     flock -n 9 || die "Another Entropy39 setup process is already running."
+    trap cleanup_password_file EXIT
 
-    if dashboard_is_verified; then
-        log "Existing Dashboard installation verified; installation is not being repeated"
-    else
-        log "Installing the Entropy39 Dashboard"
-        "${DASHBOARD_INSTALLER}"
-    fi
-    verify_dashboard
-    log "Dashboard installation verified"
+    if dashboard_is_verified; then log "Existing Dashboard installation verified; installation is not being repeated"
+    else log "Installing the Entropy39 Dashboard"; "$DASHBOARD_INSTALLER"; fi
+    verify_dashboard; log "Dashboard installation verified"
 
-    if bitcoin_is_complete; then
-        log "A complete Bitcoin Core installation is already present; verifying it"
-    else
-        log "Starting the interactive Bitcoin Core installer"
-        "${BITCOIN_INSTALLER}"
-    fi
-    verify_bitcoin
-    log "Bitcoin Core installation verified"
+    if bitcoin_is_complete; then log "A complete Bitcoin Core installation is already present; verifying it"
+    else log "Starting the interactive Bitcoin Core installer with deferred startup"; "$BITCOIN_INSTALLER" --no-start; fi
+    verify_bitcoin_installed
+    ensure_bitcoin_stopped
+    detect_node_mode
+    mark_base_complete
+    log "Base Dashboard and Bitcoin Core installation recorded"
 
+    load_or_choose_apps
+    configure_selected_apps
+    start_and_verify_bitcoin
+    start_configured_apps
     mark_complete
     log "Entropy39 Node installation is complete. Normal tty1 login will be restored."
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

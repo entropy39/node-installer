@@ -9,7 +9,8 @@ Debian preseed and reproducible ISO construction tooling.
 
 ## Repository layout
 
-- `installers/` contains the authoritative Dashboard and Bitcoin Core installers.
+- `installers/` contains the authoritative Dashboard and Bitcoin Core installers,
+  plus self-contained optional application installers under `installers/apps/`.
 - `firstboot/` contains the minimal ISO bootstrap, tty1 setup service and master
   setup program.
 - `debian/` contains the Debian Installer preseed configuration.
@@ -21,16 +22,42 @@ remain authoritative in the Dashboard repository.
 
 ## First-boot flow
 
-The Debian installer copies only `firstboot`, its cleanup helper and
-the systemd unit into the installed system. On the first boot, a temporary local
-tty1 `agetty` starts the bootstrap as root. SSH root login is not enabled or
+The ISO contains a fixed snapshot of the runtime installer files present in the
+local working tree when it was built, including uncommitted changes. Debian
+Installer deploys that snapshot under `/usr/local/lib/node-installer`, owned by
+root and protected by SHA-256 manifests. On first boot, a temporary local tty1
+`agetty` verifies and runs the embedded snapshot as root; it does not download
+the node installer from GitHub. The build commit, dirty state and snapshot digest
+are recorded under `/var/lib/entropy39-node/`. SSH root login is not enabled or
 changed.
 
-The bootstrap retrieves the `main` branch of this repository as a single Git
-commit, checks out that exact commit, verifies the Git object database and
-working tree, and records the commit under `/var/lib/entropy39-node/`. The master
-setup then installs and verifies the Dashboard before running and verifying the
-interactive Bitcoin Core installer.
+The master setup installs and verifies the Dashboard, then installs Bitcoin Core without
+starting it. A `whiptail` checklist offers compatible optional applications,
+with none selected by default. Selected applications are configured before
+Bitcoin Core starts, after which their services are started and verified.
+
+The base installation, optional application configuration and optional
+application activation are recorded separately under
+`/var/lib/entropy39-node/`. If an optional installer fails, the recovery menu
+allows retrying it or continuing without it once the Bitcoin configuration is
+confirmed safe.
+
+The self-contained Explorer installer can also be run directly as root with
+`installers/apps/explorer/install-explorer.sh --install`. Bitcoin Core and
+`/etc/bitcoin.conf` must already exist, but Core may be running or stopped. A
+fresh install adds the Explorer RPC credential, validates the installed files
+and Apache configuration, and enables `explorer.service` without starting it.
+If Core is already running, restart it later so the new credential takes effect,
+then start Explorer. The `--update` path does not require Bitcoin Core to be
+running and does not modify its configuration. It preserves whether Explorer
+was running or stopped; running instances retain runtime verification and
+rollback, while stopped instances remain stopped after the update.
+
+Run `installers/apps/explorer/install-explorer.sh --uninstall` to remove an
+installer-managed Explorer deployment. Uninstall removes only verified Explorer
+files and its RPC entry, retains the dedicated service account, preserves a
+non-empty cache and unknown state, and records progress so an interrupted
+cleanup can be resumed by running the same command again.
 
 Successful setup creates `/var/lib/entropy39-node/setup-complete`, disables the
 temporary first-boot service and restores the normal Debian tty1 getty. Failure
